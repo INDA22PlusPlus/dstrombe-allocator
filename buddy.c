@@ -1,19 +1,20 @@
 #include <stdlib.h>
+#include <stdint.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <assert.h>
 #include "buddy.h"
 #include <stdio.h>
-static size_t MIN_BLOCK_SIZE = 32;
-static int CURR_ORDER = 0;
-static int BASE_PTR = 0; // must be initialized
-static size_t DEFAULT_HEAP_SIZE = 4096; // so we allocate just 1 page by default
+
+#define MIN_BLOCK_SIZE 32
+#define DEFAULT_HEAP_SIZE 4096 // so we allocate just 1 page by default
 
 // this can't be a const, bc consts are mutable in c. lol 
-#define LEVELS 8
+// max size of a block is 2^LEVELS
+#define LEVELS 16
 
-#define USE_SBRK
+#define USE_MMAP
 
 struct chunk_mdata* head = NULL; 
 
@@ -26,15 +27,15 @@ struct chunk_mdata {
     struct chunk_mdata* prev;
 };
 
-// buddy allocator
-
+// the implementation of free
 void fr33(void* ptr) {
     struct chunk_mdata* chunk_to_free = (struct chunk_mdata*)ptr;
     struct chunk_mdata* buddy = get_buddy(chunk_to_free);
 
     // if the chunk already has a free buddy, they should be merged
-    if (buddy && buddy->chunk_flag == FREE) {
+    while (buddy && buddy->chunk_flag == FREE) {
         chunk_to_free = merge_chunks(chunk_to_free, buddy);
+        buddy = get_buddy(chunk_to_free);
     }
     
     chunk_to_free->chunk_flag = FREE;
@@ -59,6 +60,7 @@ struct chunk_mdata* merge_chunks(struct chunk_mdata* lh, struct chunk_mdata* rh)
     return primary_chunk;
 }
 
+// append an item to the free list
 void append_to_free_list(struct chunk_mdata* chunk_to_append) {
     if(free_list[chunk_to_append->order]) {
         // traverse the linked list to the end
@@ -76,13 +78,15 @@ void append_to_free_list(struct chunk_mdata* chunk_to_append) {
 }
 
 
-// TODO double check
+// get the buddy of a given chunk
 struct chunk_mdata* get_buddy(struct chunk_mdata* chunk) {
     long addr = (long)chunk;
-    long addr_of_buddy = addr ^ (1 << chunk->order);
+    // buddy will be 2^order bytes to the left or right of the chunk.
+    long addr_of_buddy = addr ^ (1 << chunk->order); 
     return (struct chunk_mdata*)addr_of_buddy;
 }
 
+// the actual malloc function
 void* mall0c(size_t size) {
     // this pointer will be handed out to the caller
     struct chunk_mdata* chunk_to_distribute = NULL;
@@ -91,7 +95,7 @@ void* mall0c(size_t size) {
         return NULL;
     }
     short int order = order_from_size(size);
-    if (free_list[order] == NULL) {
+    if (!free_list[order]) {
         // no free chunk of this order
         // search superior orders 
         short int i = order;
@@ -109,7 +113,6 @@ void* mall0c(size_t size) {
         }
 
         struct chunk_mdata* suitable_chunk = cascade_split(free_chunk, order);
-        
         // remove this chunk from the free list
         // offsetting the chunk by sizeof(chunk_mdata) will yield an address pointing to the data
         chunk_to_distribute = suitable_chunk; 
@@ -117,49 +120,86 @@ void* mall0c(size_t size) {
     else {
         chunk_to_distribute = free_list[order];
     }
-
     // flag the chunk as in use
     chunk_to_distribute->chunk_flag = IN_USE;
-
     // remove the returned pointer from our free list
     // the start of the free list will now point to the 2nd first element in the free list
     // if chunk_to_distribute->next is null then so will this free list be. aka empty
     free_list[order] = chunk_to_distribute->next;
+    fflush(stdout);
     return (void*)((long)chunk_to_distribute + sizeof(struct chunk_mdata));;
 }
 
-struct chunk_mdata* resize_heap(size_t req_size) {    
-    if(!head) {
-        // initialize the heap as a single 4k page 
-        void* mc = morecore(DEFAULT_HEAP_SIZE);
-        return new_chunk(mc, FREE, order_from_size(DEFAULT_HEAP_SIZE), NULL, NULL);
-    }
-    
-    // find the highest non-free level
-    // we need to mmap max(req_sie, sizeof(highest_non_free_level)) 
-    // this is slow but morecore will be called so infrequently that it is fine -- no "occupied" list is needed
-    struct chunk_mdata* curr_chunk = head;
-    short int max_order_in_use = head->order;
-    while(curr_chunk->next) {
-        max_order_in_use = curr_chunk->order > max_order_in_use ? curr_chunk->order : max_order_in_use; 
-        curr_chunk = curr_chunk->next;
-    }
+// Add a new chunk whose order is at least one order grater than the largest currently allocated order
+struct chunk_mdata* resize_heap(size_t req_size) {
+    size_t total_size = 0;
+    struct chunk_mdata* local_tail = NULL;
+    while(total_size < req_size) {
+        struct chunk_mdata* chunk_to_add = NULL;
+        if(!head) {
+            // initialize the heap
+            size_t heap_size = DEFAULT_HEAP_SIZE - sizeof(struct chunk_mdata); //size_from_order(order_from_size(req_size));
+            void* mc = morecore(heap_size);
+            head = new_chunk(mc, FREE, order_from_size(heap_size), NULL, NULL);
+            chunk_to_add = head;
+        }
+        else {
+            // double the current size of the heap
+            size_t length_of_heap = (long)get_end_of_heap() - (long)head;
 
-    // the order right above the highest allocated order
-    size_t h_size = MIN_BLOCK_SIZE << (max_order_in_use + 1);
-    size_t size_to_allocate = h_size > req_size ? h_size : req_size; 
-    void* new_pages = morecore(size_to_allocate); 
+            // the order right above the highest allocated order
+            size_t size_to_allocate = (length_of_heap << 1) - sizeof(struct chunk_mdata);
+            
+            // size_t size_to_allocate = h_size > req_size ? double_heap_size : req_size; 
+            void* new_pages = morecore(size_to_allocate); 
+            
+            chunk_to_add = new_chunk(new_pages, FREE, order_from_size(size_to_allocate), NULL, NULL);
+        }   
+        total_size += size_from_order(chunk_to_add->order);
+        // we append from the tail so that we return a pointer to the largest chunk
+        if(local_tail) {
+            struct chunk_mdata* curr_chunk = local_tail;
+            while(curr_chunk->prev) {
+                curr_chunk = curr_chunk->prev;
+            }
+            curr_chunk->prev = chunk_to_add;
+            chunk_to_add->next = curr_chunk;
+
+        }
+        else {
+            local_tail = chunk_to_add;
+        }
+        append_to_free_list(chunk_to_add);
+         
+    }
     
-    return new_chunk(new_pages, FREE, order_from_size(size_to_allocate), NULL, NULL);
+    return local_tail;
 }
 
-// should use sbrk
-void* morecore(size_t size) {
-    
+// get the end of the heap
+// either head must exist or USE_SBRK must be defined
+void* get_end_of_heap() {
     #ifdef USE_SBRK
-        sbrk(size);
-        return (void*)((long)sbrk(0) - size);
+        return sbrk(0);
     #else
+        struct chunk_mdata* curr_chunk = head;
+        while(curr_chunk->next) {
+            curr_chunk = curr_chunk->next;
+        }
+        // the end of the heap is the end of the final chunk
+        return (void*)((long)curr_chunk + (long)(sizeof(struct chunk_mdata) + size_from_order(curr_chunk->order)));
+    #endif
+}
+
+// Request more memory from the OS
+void* morecore(size_t size) {
+
+    #ifdef USE_SBRK
+        // sbrk is slightly faster than mmap
+        sbrk(size); // grow the heap by size bytes
+        return (void*)((long)sbrk(0) - size); // sbrk(0) returns a pointer to the end of the heap
+    #else
+        //mmap is not as popular as sbrk, but it is more portable as brk/sbrk are not POSIX
         return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     #endif
 }
@@ -172,9 +212,32 @@ struct chunk_mdata* cascade_split(struct chunk_mdata* free_chunk, short int targ
     // split the chunks in a cascading fashion
     struct chunk_mdata* chunk_to_split = free_chunk; 
     for(short int j = top_order; j > target_order; j--) {
+
+        // remove the chunk from the free list
+        short int is_in_free_list = 0;
+        struct chunk_mdata* curr_chunk = free_list[j];
+        while(curr_chunk->next) {
+            if(curr_chunk == chunk_to_split) {
+                is_in_free_list = 1;
+            }
+            curr_chunk = curr_chunk->next;
+        }
+        if(is_in_free_list) {
+            // remove the chunk from the free list
+            if(chunk_to_split->prev) {
+                chunk_to_split->prev->next = chunk_to_split->next;
+            }
+            else {
+                free_list[j] = chunk_to_split->next;
+            }
+            if(chunk_to_split->next) {
+                chunk_to_split->next->prev = chunk_to_split->prev;
+            }
+        }
+
         struct chunk_mdata* right_hand_block = split_chunk(chunk_to_split);
         right_hand_block->chunk_flag = FREE;
-        free_list[j] = right_hand_block; // add the right hand chunk back to the free list
+        append_to_free_list(right_hand_block); // add the right hand chunk back to the free list
         
         // ! the left hand block is kept, to be split further !
     }
@@ -185,8 +248,8 @@ struct chunk_mdata* cascade_split(struct chunk_mdata* free_chunk, short int targ
 // the primary chunk remains as chunk_to_split;
 struct chunk_mdata* split_chunk(struct chunk_mdata* chunk_to_split) {
     chunk_to_split->order--;
-    size_t size_of_chunk_w_header = sizeof(struct chunk_mdata) + size_from_order(chunk_to_split->order);
-    void* new_chunk_addr = (void*)((long)chunk_to_split + size_of_chunk_w_header);
+    size_t size_of_chunk = size_from_order(chunk_to_split->order);
+    void* new_chunk_addr = (void*)((long)chunk_to_split + size_of_chunk);
     
     // create the new chunk, its *next will point to the old chunks next
     // its *prev will point the old chunk
@@ -197,6 +260,7 @@ struct chunk_mdata* split_chunk(struct chunk_mdata* chunk_to_split) {
     return n_chunk;
 }
 
+// construct a new chunk
 struct chunk_mdata* new_chunk(void* addr, enum flag chunk_flag, short int order, struct chunk_mdata* next, struct chunk_mdata* prev) {
     struct chunk_mdata* n_chunk = (struct chunk_mdata*)(addr);
     n_chunk->chunk_flag = chunk_flag;
@@ -207,15 +271,17 @@ struct chunk_mdata* new_chunk(void* addr, enum flag chunk_flag, short int order,
     return n_chunk;
 }
 
+// given an order, return the corresponding chunk size in bytes (including the chunk metadata)
 size_t size_from_order(short int order) {
-    return MIN_BLOCK_SIZE << order; 
+    return (MIN_BLOCK_SIZE << order) + sizeof(struct chunk_mdata);
 }
 
-// returns the order that can hold the requested size
+// returns the order that can hold the requested size (includin metadata)
 // would need to use log2 if we were not using this while loop
 short int order_from_size(size_t size) {
     short int i = 0;
-    while((size >> i) > MIN_BLOCK_SIZE) {
+    size_t total_size = sizeof(struct chunk_mdata) + size;
+    while((total_size >> i) > MIN_BLOCK_SIZE) {
         i++;
         
     }

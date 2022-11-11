@@ -14,7 +14,7 @@ void* mall0c(size_t size);
 struct chunk_mdata* resize_heap(size_t req_size);
 
 void* morecore(size_t size);
-
+void* get_end_of_heap();
 struct chunk_mdata* cascade_split(struct chunk_mdata* free_chunk, short int target_order); 
 
 struct chunk_mdata* split_chunk(struct chunk_mdata* chunk_to_split); 

@@ -19,9 +19,9 @@ int main(int argc, char **argv)
   char *a, *b, *c, *d, *e;
 
   a = mall0c(32);
-  b = mall0c(32);
+  b = mall0c(12345);
   c = mall0c(32);
-  d = mall0c(32);
+  d = mall0c(1024);
   e = mall0c(32);
 
   strcpy(a, argv[1]);
@@ -36,5 +36,8 @@ int main(int argc, char **argv)
   fr33(d);
   fr33(e);
 
+  char *f = mall0c(8192);
+  strcpy(f, argv[6]);
+  fr33(f);
   printf("dynamite failed?\n");
 }
